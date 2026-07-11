@@ -161,10 +161,9 @@ esqc_gps, ///
     reasoning(medium)
 ```
 
-`gpt-5.6-luna` is the command's AI default. The exact supported model allowlist is:
+`gpt-5.6-luna` in the API is the command's AI default. The exact supported model allowlist is:
 
 ```text
-gpt-5.6
 gpt-5.6-sol
 gpt-5.6-terra
 gpt-5.6-luna
