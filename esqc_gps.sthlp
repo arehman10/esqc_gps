@@ -327,10 +327,14 @@ The final {it:tests/stata_smoke.do} acceptance test must be run in the target
 Stata installation; the distributed automated Java tests use a mock SFI rather
 than a licensed Stata runtime.{p_end}
 
-{title:Author and status}
+{marker author}{...}
+{title:Author}
 
 {pstd}
-{bf:Author:} Attique Ur Rehman, Enterprise Analysis Unit, World Bank.{p_end}
+{bf:Attique Ur Rehman}, Economist{break}
+The World Bank {hline 1} Development Economics (DEC), Enterprise Surveys{break}
+Email: {browse "mailto:attique@worldbank.org":attique@worldbank.org}{break}
+Web: {browse "https://sites.google.com/view/attique-ur-rehman":https://sites.google.com/view/attique-ur-rehman}
 
 {pstd}
 Developed with help of gpt-5.6 sol ultra.{p_end}
