@@ -1,7 +1,12 @@
-package com.stata.sfi;
-import java.io.File;
-public final class SFIToolkit {
-    public static void displayln(String value) { System.out.println(value); }
-    public static void errorln(String value) { System.err.println(value); }
-    public static File resolvePath(String value) { return new File(value); }
-}
+v 3
+d ESQC GPS: standalone Admin2 GPS quality control through Stata SFI
+d Version 1.2.0, 11 July 2026
+d Author: Attique Ur Rehman, Enterprise Analysis Unit, World Bank
+d Developed with help of gpt-5.6 sol ultra
+d Requires Stata 16, Java 11, Python 3.10, pyshp, Shapely, and pyproj
+p esqc_gps Standalone GPS QC with GPT-5.6 Luna review, full audit logging, and HTML maps
+f esqc_gps.ado
+f esqc_gps.sthlp
+f esqc_gps.jar
+f esqc_gps_log.ado
+f esqc_gps_log.sthlp
