@@ -1,0 +1,20 @@
+import com.stata.sfi.Data;
+import org.worldbank.esqc.GpsSfi;
+
+public final class Harness {
+    public static void main(String[] args) {
+        if (args.length != 1) {
+            System.err.println("usage: Harness CONFIG");
+            System.exit(2);
+        }
+        int rc = GpsSfi.run(new String[]{args[0]});
+        System.out.println("RC=" + rc);
+        System.out.println("STATUS1=" + Data.value("esqc_gps_status", 1));
+        System.out.println("FLAG1=" + Data.value("esqc_gps_flag", 1));
+        System.out.println("ADMIN1_1=" + Data.value("esqc_gps_admin1", 1));
+        System.out.println("ADMIN2_1=" + Data.value("esqc_gps_admin2", 1));
+        System.out.println("STATUS2=" + Data.value("esqc_gps_status", 2));
+        System.out.println("FLAG2=" + Data.value("esqc_gps_flag", 2));
+        System.exit(rc);
+    }
+}

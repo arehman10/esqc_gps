@@ -1,0 +1,800 @@
+from __future__ import annotations
+
+import csv
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+import unittest
+import zipfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+
+import shapefile
+from pyproj import CRS, Transformer
+
+ROOT = Path(__file__).resolve().parents[1]
+WORKER = ROOT / "resources" / "gps_qc.py"
+EXPECTED_HEADER = [
+    "row_id",
+    "tid",
+    "lat",
+    "lon",
+    "gps_status",
+    "gps_flag",
+    "predicted_admin2",
+    "predicted_admin1",
+    "a3a_status",
+    "a3x_status",
+    "detail",
+]
+
+
+def clockwise_square(minx: float, miny: float, maxx: float, maxy: float) -> list[list[float]]:
+    return [
+        [minx, miny],
+        [minx, maxy],
+        [maxx, maxy],
+        [maxx, miny],
+        [minx, miny],
+    ]
+
+
+def write_layer(directory: Path, *, epsg: int = 4326, write_prj: bool = True) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    base = directory / "test_adm2"
+    writer = shapefile.Writer(str(base), shapeType=shapefile.POLYGON, encoding="utf-8")
+    writer.field("NAM_0", "C", size=80)
+    writer.field("NAM_1", "C", size=80)
+    writer.field("NAM_2", "C", size=80)
+
+    polygons = [
+        (clockwise_square(10.0, 10.0, 11.0, 11.0), "North", "Alpha"),
+        (clockwise_square(11.0, 10.0, 12.0, 11.0), "South", "Beta"),
+    ]
+    if epsg != 4326:
+        transformer = Transformer.from_crs(4326, epsg, always_xy=True)
+        projected = []
+        for ring, admin1, admin2 in polygons:
+            projected.append(([[*transformer.transform(x, y)] for x, y in ring], admin1, admin2))
+        polygons = projected
+
+    for ring, admin1, admin2 in polygons:
+        writer.poly([ring])
+        writer.record("Testland", admin1, admin2)
+    writer.close()
+    (base.with_suffix(".cpg")).write_text("UTF-8\n", encoding="ascii")
+    if write_prj:
+        base.with_suffix(".prj").write_text(CRS.from_epsg(epsg).to_wkt(), encoding="utf-8")
+    return base.with_suffix(".shp")
+
+
+def write_input(path: Path, rows: list[dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def default_rows() -> list[dict[str, Any]]:
+    return [
+        {"row_id": 1, "tid": "dup", "lat": 10.5, "lon": 10.5, "a3a": "North", "a3x": "Alpha"},
+        {"row_id": 2, "tid": "two", "lat": 10.5, "lon": 10.5, "a3a": "South", "a3x": "Alpha"},
+        {"row_id": 3, "tid": "three", "lat": 10.5, "lon": 10.5, "a3a": "North", "a3x": "Unknown Place"},
+        {"row_id": 4, "tid": "four", "lat": 20.0, "lon": 20.0, "a3a": "", "a3x": ""},
+        {"row_id": 5, "tid": "five", "lat": None, "lon": 10.5, "a3a": "North", "a3x": "Alpha"},
+        {"row_id": 6, "tid": "six", "lat": 10.5, "lon": 10.5, "a3a": "", "a3x": ""},
+        {"row_id": 7, "tid": "dup", "lat": 10.5, "lon": 11.5, "a3a": "South", "a3x": "Beta"},
+    ]
+
+
+def run_worker(
+    root: Path,
+    shapefile_path: Path,
+    rows: list[dict[str, Any]],
+    *,
+    extra: dict[str, Any] | None = None,
+    env: dict[str, str] | None = None,
+) -> tuple[subprocess.CompletedProcess[str], Path, Path, Path, Path]:
+    root.mkdir(parents=True, exist_ok=True)
+    input_path = root / "input.jsonl"
+    output_path = root / "result.csv"
+    marker_path = root / "success.marker"
+    cache_path = root / "cache.json"
+    config_path = root / "config.json"
+    write_input(input_path, rows)
+    config: dict[str, Any] = {
+        "INPUT_JSONL": str(input_path),
+        "OUTPUT_CSV": str(output_path),
+        "SUCCESS_MARKER": str(marker_path),
+        "SHP_PATH": str(shapefile_path),
+        "COUNTRY_NAME": "Testland",
+        "COUNTRY_FIELD": "NAM_0",
+        "ADMIN1_FIELD": "NAM_1",
+        "ADMIN2_FIELD": "NAM_2",
+        "ASSUME_WGS84": False,
+        "CACHE_FILE": str(cache_path),
+        "AI_VERIFY": False,
+        "AI_MODEL": "gpt-5.6-luna",
+        "VISION_ENABLED": False,
+        "WEB_SEARCH": False,
+        "BASEMAP": "osm",
+        "REASONING_EFFORT": "medium",
+        "AI_BATCH_SIZE": 10,
+        "VISION_BATCH_SIZE": 3,
+        "HTTP_TIMEOUT_SECS": 30,
+        "SNAP_TOLERANCE_KM": 0,
+    }
+    if extra:
+        config.update(extra)
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    process_env = os.environ.copy()
+    process_env.pop("ESQC_AI_KEY", None)
+    process_env.pop("OPENAI_API_KEY", None)
+    process_env.setdefault("ESQC_GPS_LOG_DIR", str(root / "full_logs"))
+    if env:
+        process_env.update(env)
+    completed = subprocess.run(
+        [sys.executable, str(WORKER), str(config_path)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=process_env,
+        timeout=90,
+        check=False,
+    )
+    return completed, output_path, marker_path, cache_path, config_path
+
+
+def read_rows(path: Path) -> list[dict[str, str]]:
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames != EXPECTED_HEADER:
+            raise AssertionError(f"unexpected header: {reader.fieldnames}")
+        return list(reader)
+
+
+class WorkerTests(unittest.TestCase):
+    def test_deterministic_contract_statuses_cache_and_zip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shp = write_layer(root / "shape")
+            completed, output, marker, cache, _ = run_worker(root / "first", shp, default_rows())
+            self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+            self.assertEqual(
+                marker.read_text(encoding="utf-8").strip(),
+                "ESQC_GPS_OK\tversion=1.2.0\tschema=sfi11\trows=7",
+            )
+            audit_dir = root / "first" / "full_logs"
+            audit_files = list(audit_dir.glob("esqc_gps_*.jsonl"))
+            self.assertEqual(len(audit_files), 1)
+            audit_text = audit_files[0].read_text(encoding="utf-8")
+            self.assertIn('"event":"run_started"', audit_text)
+            self.assertIn('"log_policy":"always_full"', audit_text)
+            self.assertIn('"openai_store_policy":"forced_true"', audit_text)
+            self.assertIn('"event":"run_finished"', audit_text)
+            rows = read_rows(output)
+            self.assertEqual([int(row["row_id"]) for row in rows], list(range(1, 8)))
+            self.assertEqual([row["tid"] for row in rows][0::6], ["dup", "dup"])
+            self.assertEqual(
+                [row["gps_status"] for row in rows],
+                ["ok", "mismatch", "reported_not_found", "outside_country", "missing", "no_reported_location", "ok"],
+            )
+            self.assertEqual([row["gps_flag"] for row in rows], ["0", "1", "1", "1", "1", "1", "0"])
+            self.assertEqual(rows[0]["predicted_admin1"], "North")
+            self.assertEqual(rows[0]["predicted_admin2"], "Alpha")
+            self.assertEqual(rows[1]["a3a_status"], "mismatch")
+            self.assertEqual(rows[2]["a3x_status"], "not_found")
+            cache_payload = json.loads(cache.read_text(encoding="utf-8"))
+            self.assertEqual(cache_payload["version"], "1.2.0")
+            self.assertEqual(len(cache_payload["entries"]), 7)
+            self.assertEqual(
+                rows[0]["detail"],
+                "OK: GPS in Alpha, North; a3a 'North' includes North; a3x 'Alpha' contains GPS.",
+            )
+            self.assertNotIn("AI alignment", rows[0]["detail"])
+
+            # The same layer inside a ZIP must behave identically; signature and
+            # row cache keys do not depend on the temporary extraction path.
+            archive = root / "adm2.zip"
+            with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+                for sidecar in sorted((root / "shape").glob("test_adm2.*")):
+                    zf.write(sidecar, arcname=f"nested/{sidecar.name}")
+            second_root = root / "second"
+            second_root.mkdir()
+            completed2, output2, marker2, _, _ = run_worker(second_root, archive, default_rows())
+            self.assertEqual(completed2.returncode, 0, completed2.stderr + completed2.stdout)
+            self.assertTrue(marker2.exists())
+            self.assertEqual(
+                [(r["row_id"], r["gps_status"]) for r in read_rows(output2)],
+                [(r["row_id"], r["gps_status"]) for r in rows],
+            )
+
+    def test_projected_crs_is_transformed_to_wgs84(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shp = write_layer(root / "shape3857", epsg=3857)
+            rows = [{"row_id": 1, "tid": "p", "lat": 10.5, "lon": 10.5, "a3a": "North", "a3x": "Alpha"}]
+            completed, output, marker, _, _ = run_worker(root / "run", shp, rows)
+            self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+            self.assertTrue(marker.exists())
+            result = read_rows(output)[0]
+            self.assertEqual(result["gps_status"], "ok")
+            self.assertEqual(result["predicted_admin2"], "Alpha")
+
+    def test_missing_crs_fails_closed_unless_assumed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shp = write_layer(root / "shape", write_prj=False)
+            rows = [{"row_id": 1, "tid": "p", "lat": 10.5, "lon": 10.5, "a3a": "North", "a3x": "Alpha"}]
+            failed, _, marker, _, _ = run_worker(root / "fail", shp, rows)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertFalse(marker.exists())
+            self.assertIn("CRS sidecar is missing", failed.stderr)
+
+            passed, output, marker2, _, _ = run_worker(
+                root / "pass",
+                shp,
+                rows,
+                extra={"ASSUME_WGS84": True},
+            )
+            self.assertEqual(passed.returncode, 0, passed.stderr + passed.stdout)
+            self.assertTrue(marker2.exists())
+            self.assertEqual(read_rows(output)[0]["gps_status"], "ok")
+
+    def test_zip_path_traversal_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive = root / "bad.zip"
+            with zipfile.ZipFile(archive, "w") as zf:
+                zf.writestr("../escape.shp", b"not-a-shapefile")
+            run_root = root / "run"
+            run_root.mkdir()
+            completed, _, marker, _, _ = run_worker(run_root, archive, default_rows()[:1])
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertFalse(marker.exists())
+            self.assertIn("unsafe traversal path", completed.stderr)
+            self.assertFalse((root / "escape.shp").exists())
+
+    def test_ai_request_uses_luna_responses_structured_output_and_current_cache_fields(self) -> None:
+        requests: list[dict[str, Any]] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self) -> None:  # noqa: N802 - stdlib hook
+                length = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(length).decode("utf-8"))
+                requests.append({"path": self.path, "headers": dict(self.headers), "body": body})
+                payload = {
+                    "id": "resp_test",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": json.dumps(
+                                        {
+                                            "results": [
+                                                {
+                                                    "case_id": "c1",
+                                                    "a3a_status": "match",
+                                                    "a3a_confidence": "medium",
+                                                    "a3a_reason": "Common Admin1 abbreviation.",
+                                                    "a3x_status": "match",
+                                                    "a3x_confidence": "high",
+                                                    "a3x_reason": "Locked deterministic locality match.",
+                                                }
+                                            ]
+                                        }
+                                    ),
+                                }
+                            ],
+                        }
+                    ],
+                    "usage": {
+                        "input_tokens": 100,
+                        "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 100},
+                        "output_tokens": 20,
+                        "output_tokens_details": {"reasoning_tokens": 5},
+                        "total_tokens": 120,
+                    },
+                }
+                encoded = json.dumps(payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, fmt: str, *args: Any) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                shp = write_layer(root / "shape")
+                # Deterministically a3a is unresolved, so it enters the text AI pass.
+                rows = [{"row_id": 1, "tid": "ai", "lat": 10.5, "lon": 10.5, "a3a": "N. region", "a3x": "Alpha"}]
+                completed, output, marker, _, _ = run_worker(
+                    root / "run",
+                    shp,
+                    rows,
+                    extra={
+                        "AI_VERIFY": True,
+                        "AI_MODEL": "gpt-5.6-luna",
+                        "VISION_ENABLED": False,
+                        "WEB_SEARCH": True,
+                        "REASONING_EFFORT": "medium",
+                    },
+                    env={
+                        "ESQC_AI_KEY": "sk-test-secret",
+                        "OPENAI_BASE_URL": f"http://127.0.0.1:{server.server_port}/v1",
+                    },
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+                self.assertTrue(marker.exists())
+                self.assertEqual(read_rows(output)[0]["gps_status"], "ok")
+
+            self.assertEqual(len(requests), 1)
+            request = requests[0]
+            self.assertEqual(request["path"], "/v1/responses")
+            self.assertEqual({k.lower(): v for k, v in request["headers"].items()}.get("authorization"), "Bearer sk-test-secret")
+            body = request["body"]
+            self.assertEqual(body["model"], "gpt-5.6-luna")
+            self.assertIs(body["store"], True)
+            self.assertEqual(body["reasoning"], {"effort": "medium"})
+            self.assertEqual(body["prompt_cache_options"], {"mode": "implicit", "ttl": "30m"})
+            self.assertNotIn("prompt_cache_retention", body)
+            self.assertTrue(body["prompt_cache_key"].startswith("esqc:gps:gps_align:"))
+            self.assertEqual(body["tools"], [{"type": "web_search", "search_context_size": "low"}])
+            self.assertEqual(body["tool_choice"], "auto")
+            self.assertIs(body["parallel_tool_calls"], False)
+            fmt = body["text"]["format"]
+            self.assertEqual(fmt["type"], "json_schema")
+            self.assertEqual(fmt["name"], "esqc_gps_alignment")
+            self.assertIs(fmt["strict"], True)
+            self.assertEqual(fmt["schema"]["additionalProperties"], False)
+            item_schema = fmt["schema"]["properties"]["results"]["items"]
+            self.assertIn("a3x_confidence", item_schema["required"])
+            self.assertIn("a3x_reason", item_schema["required"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_vision_boundary_clear_does_not_erase_reported_location_checks(self) -> None:
+        spec = importlib.util.spec_from_file_location("esqc_gps_worker_test", WORKER)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+
+        class FakeClient:
+            def call(self, **kwargs: Any) -> dict[str, Any]:
+                blocks = kwargs["user_content"]
+                case_ids = [
+                    block["text"].split(":", 1)[1].strip()
+                    for block in blocks
+                    if block.get("type") == "input_text"
+                    and str(block.get("text", "")).startswith("CASE_ID:")
+                ]
+                return {
+                    "results": [
+                        {
+                            "case_id": case_id,
+                            "keep_existing": False,
+                            "final_gps_status": "ok",
+                            "confidence": "high",
+                            "notes": "inside expected country",
+                        }
+                        for case_id in case_ids
+                    ]
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shp = write_layer(root / "shape")
+            layer = module.load_country_layer(
+                shp, "Testland", "NAM_0", "NAM_1", "NAM_2", False
+            )
+            source_rows = [
+                {"row_id": 1, "tid": "match", "lat": 10.5, "lon": 9.99, "a3a": "North", "a3x": "Alpha"},
+                {"row_id": 2, "tid": "mismatch", "lat": 10.5, "lon": 9.99, "a3a": "South", "a3x": "Alpha"},
+                {"row_id": 3, "tid": "missing", "lat": 10.5, "lon": 9.99, "a3a": "", "a3x": ""},
+            ]
+            results = [module._deterministic_result(row, layer, 0.0) for row in source_rows]
+            for row in results:
+                row["_from_cache"] = False
+                self.assertEqual(row["gps_status"], "outside_country")
+
+            original_fetch = module._fetch_map_image
+            module._fetch_map_image = lambda *args, **kwargs: ("ZmFrZQ==", 1, 1)
+            try:
+                module.ai_verify_outside(results, FakeClient(), layer, "osm", 9, 15, 3)
+            finally:
+                module._fetch_map_image = original_fetch
+
+            self.assertEqual(results[0]["gps_status"], "ok")
+            self.assertEqual(results[0]["gps_flag"], 0)
+            self.assertEqual(results[0]["predicted_admin1"], "North")
+            self.assertEqual(results[0]["predicted_admin2"], "Alpha")
+            self.assertEqual(results[0]["a3a_status"], "match")
+            self.assertEqual(results[0]["a3x_status"], "match")
+
+            self.assertEqual(results[1]["gps_status"], "mismatch")
+            self.assertEqual(results[1]["gps_flag"], 1)
+            self.assertEqual(results[1]["a3a_status"], "mismatch")
+            self.assertEqual(results[1]["a3x_status"], "match")
+
+            self.assertEqual(results[2]["gps_status"], "no_reported_location")
+            self.assertEqual(results[2]["gps_flag"], 1)
+
+    def test_admin1_union_uses_any_member_and_supports_global_codes(self) -> None:
+        spec = importlib.util.spec_from_file_location("esqc_gps_union_test", WORKER)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+
+        names = [
+            "New South Wales",
+            "Australian Capital Territory",
+            "Queensland",
+            "Northern Territory",
+            "California",
+            "Nevada",
+        ]
+        aliases = module._build_admin1_aliases(
+            names,
+            "Australia",
+            {"California": {"US-CA"}, "Nevada": {"US-NV"}},
+        )
+        layer = module.CountryLayer(
+            country="Australia",
+            geoms=[],
+            props=[{"admin1": name, "admin2": ""} for name in names],
+            tree=None,
+            geom_id_to_index={},
+            admin2_name_to_indices={},
+            admin1_alias_to_names=aliases,
+        )
+
+        self.assertEqual(
+            module.check_admin1_status("NSW + ACT", "New South Wales", layer),
+            "match",
+        )
+        self.assertEqual(
+            module.check_admin1_status("NSW + ACT", "Australian Capital Territory", layer),
+            "match",
+        )
+        self.assertEqual(
+            module.check_admin1_status("QLD + NT", "New South Wales", layer),
+            "mismatch",
+        )
+        self.assertEqual(
+            module.check_admin1_status("QLD + unknown", "New South Wales", layer),
+            "not_found",
+        )
+        self.assertEqual(
+            module.check_admin1_status("US-CA / US-NV", "California", layer),
+            "match",
+        )
+
+        detail = module.location_detail(
+            "Tweed (A)",
+            "New South Wales",
+            "NSW + ACT",
+            "Mooball",
+            "match",
+            "match",
+            "ok",
+        )
+        self.assertEqual(
+            detail,
+            "OK: GPS in Tweed (A), New South Wales; a3a 'NSW + ACT' includes New South Wales; a3x 'Mooball' contains GPS.",
+        )
+        self.assertLess(len(detail), 160)
+
+    def test_ai_cannot_downgrade_a_locked_union_match(self) -> None:
+        spec = importlib.util.spec_from_file_location("esqc_gps_ai_guard_test", WORKER)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+
+        names = ["New South Wales", "Australian Capital Territory"]
+        layer = module.CountryLayer(
+            country="Australia",
+            geoms=[],
+            props=[{"admin1": name, "admin2": "Tweed (A)"} for name in names],
+            tree=None,
+            geom_id_to_index={},
+            admin2_name_to_indices={},
+            admin1_alias_to_names=module._build_admin1_aliases(names, "Australia"),
+        )
+
+        class FakeClient:
+            def call(self, **kwargs: Any) -> dict[str, Any]:
+                return {
+                    "results": [{
+                        "case_id": "c1",
+                        # Deliberately wrong: the hard guard must ignore this.
+                        "a3a_status": "mismatch",
+                        "a3a_confidence": "high",
+                        "a3a_reason": "NSW matches but ACT is extra",
+                        "a3x_status": "match",
+                        "a3x_confidence": "high",
+                        "a3x_reason": "",
+                    }]
+                }
+
+        row = {
+            "row_id": 1,
+            "tid": "case",
+            "lat": "-28.33",
+            "lon": "153.49",
+            "country": "Australia",
+            "predicted_admin1": "New South Wales",
+            "predicted_admin2": "Tweed (A)",
+            "reported_a3a": "NSW + ACT",
+            "reported_a3x": "Mooball",
+            "a3a_status": "match",
+            "a3x_status": "not_found",
+            "_det_a3a_status": "match",
+            "_det_a3x_status": "not_found",
+            "gps_status": "reported_not_found",
+            "gps_flag": 1,
+            "detail": "old",
+            "_from_cache": False,
+        }
+        module.ai_align([row], FakeClient(), layer, 10, False)
+        self.assertEqual(row["a3a_status"], "match")
+        self.assertEqual(row["a3x_status"], "match")
+        self.assertEqual(row["gps_status"], "ok")
+        self.assertEqual(row["gps_flag"], 0)
+        self.assertEqual(
+            row["detail"],
+            "OK: GPS in Tweed (A), New South Wales; a3a 'NSW + ACT' includes New South Wales; a3x 'Mooball' contains GPS.",
+        )
+        self.assertNotIn("AI alignment", row["detail"])
+
+
+    def test_campbellfield_style_locality_review_is_coordinate_aware(self) -> None:
+        spec = importlib.util.spec_from_file_location("esqc_gps_campbellfield_test", WORKER)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+
+        layer = module.CountryLayer(
+            country="Australia",
+            geoms=[],
+            props=[{"admin1": "Victoria", "admin2": "Hume (C)"}],
+            tree=None,
+            geom_id_to_index={},
+            admin2_name_to_indices={},
+            admin1_alias_to_names=module._build_admin1_aliases(["Victoria"], "Australia"),
+        )
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.request: dict[str, Any] | None = None
+
+            def call(self, **kwargs: Any) -> dict[str, Any]:
+                self.request = json.loads(kwargs["user_content"])
+                return {
+                    "results": [{
+                        "case_id": "c1",
+                        "a3a_status": "match",
+                        "a3a_confidence": "high",
+                        "a3a_reason": "VIC is Victoria.",
+                        "a3x_status": "mismatch",
+                        "a3x_confidence": "high",
+                        "a3x_reason": "Same Hume LGA, different locality.",
+                    }]
+                }
+
+        row = {
+            "row_id": 1,
+            "tid": "campbellfield",
+            "lat": "-37.61008000",
+            "lon": "144.83981000",
+            "country": "Australia",
+            "predicted_admin1": "Victoria",
+            "predicted_admin2": "Hume (C)",
+            "reported_a3a": "VIC",
+            "reported_a3x": "Cambellfield",
+            "a3a_status": "match",
+            "a3x_status": "not_found",
+            "_det_a3a_status": "match",
+            "_det_a3x_status": "not_found",
+            "gps_status": "reported_not_found",
+            "gps_flag": 1,
+            "detail": "old",
+            "_from_cache": False,
+        }
+        client = FakeClient()
+        module.ai_align([row], client, layer, 10, True)
+
+        self.assertIsNotNone(client.request)
+        case = client.request["cases"][0]
+        self.assertEqual(case["gps_lat"], "-37.61008000")
+        self.assertEqual(case["gps_lon"], "144.83981000")
+        self.assertIs(case["review_a3x"], True)
+        self.assertEqual(row["a3a_status"], "match")
+        self.assertEqual(row["a3x_status"], "mismatch")
+        self.assertEqual(row["gps_status"], "mismatch")
+        self.assertEqual(row["gps_flag"], 1)
+        self.assertEqual(
+            row["detail"],
+            "FLAG: GPS in Hume (C), Victoria; a3a 'VIC' includes Victoria; a3x 'Cambellfield' does not contain GPS; "
+            "AI: Same Hume LGA, different locality.",
+        )
+        self.assertLess(len(row["detail"]), 190)
+
+    def test_only_high_confidence_ai_can_clear_deterministic_a3x_mismatch(self) -> None:
+        spec = importlib.util.spec_from_file_location("esqc_gps_a3x_guard_test", WORKER)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+
+        layer = module.CountryLayer(
+            country="Testland",
+            geoms=[],
+            props=[{"admin1": "North", "admin2": "Alpha"}],
+            tree=None,
+            geom_id_to_index={},
+            admin2_name_to_indices={},
+            admin1_alias_to_names=module._build_admin1_aliases(["North"], "Testland"),
+        )
+
+        def make_row() -> dict[str, Any]:
+            return {
+                "row_id": 1,
+                "tid": "nested",
+                "lat": "10.50000000",
+                "lon": "10.50000000",
+                "country": "Testland",
+                "predicted_admin1": "North",
+                "predicted_admin2": "Alpha",
+                "reported_a3a": "North",
+                "reported_a3x": "Nested Town",
+                "a3a_status": "match",
+                "a3x_status": "mismatch",
+                "_det_a3a_status": "match",
+                "_det_a3x_status": "mismatch",
+                "gps_status": "mismatch",
+                "gps_flag": 1,
+                "detail": "old",
+                "_from_cache": False,
+            }
+
+        class FakeClient:
+            def __init__(self, confidence: str) -> None:
+                self.confidence = confidence
+
+            def call(self, **kwargs: Any) -> dict[str, Any]:
+                request = json.loads(kwargs["user_content"])
+                self_case = request["cases"][0]
+                assert self_case["review_a3x"] is True
+                return {
+                    "results": [{
+                        "case_id": "c1",
+                        "a3a_status": "match",
+                        "a3a_confidence": "high",
+                        "a3a_reason": "Locked.",
+                        "a3x_status": "match",
+                        "a3x_confidence": self.confidence,
+                        "a3x_reason": "Nested Town contains the exact GPS point.",
+                    }]
+                }
+
+        medium = make_row()
+        module.ai_align([medium], FakeClient("medium"), layer, 10, False)
+        self.assertEqual(medium["a3x_status"], "mismatch")
+        self.assertEqual(medium["gps_status"], "mismatch")
+        self.assertNotIn("AI:", medium["detail"])
+
+        high = make_row()
+        module.ai_align([high], FakeClient("high"), layer, 10, False)
+        self.assertEqual(high["a3x_status"], "match")
+        self.assertEqual(high["gps_status"], "ok")
+        self.assertEqual(high["gps_flag"], 0)
+        self.assertIn("AI: Nested Town contains the exact GPS point.", high["detail"])
+
+    def test_html_map_uses_google_hybrid_and_accepts_directory_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shp = write_layer(root / "shape")
+            outputs = root / "outputs"
+            outputs.mkdir()
+            rows = [{
+                "row_id": 1,
+                "tid": "</script><script>alert(1)</script>",
+                "lat": 10.5,
+                "lon": 10.5,
+                "a3a": "North",
+                "a3x": "Alpha",
+            }]
+            completed, output, marker, _, _ = run_worker(
+                root / "run",
+                shp,
+                rows,
+                extra={
+                    "CACHE_FILE": str(outputs),
+                    "MAP_HTML": str(outputs),
+                    "MAP_GEOJSON": str(outputs),
+                    "BASEMAP": "google_hybrid",
+                },
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+            self.assertTrue(marker.exists())
+            self.assertEqual(read_rows(output)[0]["gps_status"], "ok")
+
+            cache_file = outputs / "esqc_gps_cache.json"
+            map_file = outputs / "esqc_gps_map.html"
+            point_geojson = outputs / "esqc_gps_points.geojson"
+            boundary_geojson = outputs / "esqc_gps_points_boundaries.geojson"
+            for path in (cache_file, map_file, point_geojson, boundary_geojson):
+                self.assertTrue(path.is_file(), str(path))
+
+            page = map_file.read_text(encoding="utf-8")
+            self.assertIn("Google Hybrid", page)
+            self.assertIn("https://mt{s}.google.com/vt/lyrs=y", page)
+            self.assertIn('const DEFAULT_BASEMAP="Google Hybrid"', page)
+            self.assertIn("Admin2 boundaries", page)
+            self.assertIn("window.__ESQC_GPS_MAP__", page)
+            self.assertNotIn("</script><script>alert(1)</script>", page)
+            self.assertIn("\\u003c/script\\u003e", page)
+
+    def test_gondia_gondiya_spelling_variant_matches_deterministically(self) -> None:
+        spec = importlib.util.spec_from_file_location("esqc_gps_gondiya_test", WORKER)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+
+        from shapely.geometry import Point, box
+        from shapely.strtree import STRtree
+
+        geom = box(80.0, 21.0, 81.0, 22.0)
+        props = [{"admin1": "Maharashtra", "admin2": "Gondiya"}]
+        keys = {
+            module._norm_geo_name("Gondiya"): [0],
+            module._norm_geo_name_relaxed("Gondiya"): [0],
+        }
+        layer = module.CountryLayer(
+            country="India",
+            geoms=[geom],
+            props=props,
+            tree=STRtree([geom]),
+            geom_id_to_index={id(geom): 0},
+            admin2_name_to_indices=keys,
+            admin1_alias_to_names=module._build_admin1_aliases(["Maharashtra"], "India"),
+        )
+        self.assertEqual(
+            module.check_admin2_status("gondia", Point(80.5, 21.5), layer, "Maharashtra"),
+            "match",
+        )
+        self.assertEqual(module._geo_spelling_key("Gondia"), module._geo_spelling_key("Gondiya"))
+        self.assertEqual(
+            module.location_detail("Gondiya", "Maharashtra", "Maharashtra", "gondia", "match", "match", "ok"),
+            "OK: GPS in Gondiya, Maharashtra; a3a 'Maharashtra' includes Maharashtra; a3x 'gondia' contains GPS.",
+        )
+
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

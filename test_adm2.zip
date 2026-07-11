@@ -1,0 +1,1099 @@
+package org.worldbank.esqc;
+
+import com.stata.sfi.Data;
+import com.stata.sfi.Missing;
+import com.stata.sfi.SFIToolkit;
+
+import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * Stata SFI bridge for the standalone {@code esqc_gps} command.
+ *
+ * <p>Author: Attique Ur Rehman, Enterprise Analysis Unit, World Bank.<br>
+ * Developed with help of GPT-5.6 Sol Ultra.</p>
+ *
+ * <p>The method follows the signature required by {@code javacall}. It exports
+ * selected observations to a private temporary directory, launches the
+ * reviewed Python GIS worker, validates the complete result before touching
+ * the dataset, writes seven shadow variables, and publishes them only after
+ * every value has been staged successfully.</p>
+ */
+public final class GpsSfi {
+    private static final String VERSION = "1.2.0";
+    private static final String RESOURCE = "/resources/gps_qc.py";
+    private static final String[] HEADER = {
+            "row_id", "tid", "lat", "lon", "gps_status", "gps_flag",
+            "predicted_admin2", "predicted_admin1", "a3a_status",
+            "a3x_status", "detail"
+    };
+    private static final List<String> FINAL_STATUSES = Collections.unmodifiableList(Arrays.asList(
+            "ok", "mismatch", "reported_not_found", "no_reported_location",
+            "outside_country", "invalid", "missing"));
+    private static final List<String> INSIDE_STATUSES = Collections.unmodifiableList(Arrays.asList(
+            "ok", "mismatch", "reported_not_found", "no_reported_location"));
+    private static final List<String> FIELD_STATUSES = Collections.unmodifiableList(Arrays.asList(
+            "match", "mismatch", "not_found", "missing"));
+
+    private static final String[] OUTPUT_NAMES = {
+            "esqc_gps_status",
+            "esqc_gps_flag",
+            "esqc_gps_admin1",
+            "esqc_gps_admin2",
+            "esqc_gps_a3a_status",
+            "esqc_gps_a3x_status",
+            "esqc_gps_detail"
+    };
+    private static final String[] OUTPUT_LABELS = {
+            "ESQC GPS final status",
+            "ESQC GPS flag (1=review)",
+            "ESQC GPS-derived Admin1",
+            "ESQC GPS-derived Admin2",
+            "ESQC reported Admin1 match status",
+            "ESQC reported Admin2/locality match status",
+            "ESQC GPS detail"
+    };
+    private static final Pattern MARKER = Pattern.compile(
+            "^ESQC_GPS_OK\\tversion=([0-9.]+)\\tschema=sfi11\\trows=([0-9]+)$");
+
+    private GpsSfi() {
+    }
+
+    /** No-side-effect class-loader probe used by the Stata wrapper. */
+    public static int probe(String[] args) {
+        return 0;
+    }
+
+    /** Entry point used by Stata's javacall command. */
+    public static int run(String[] args) {
+        Path runDir = null;
+        Config config = null;
+        try {
+            if (args == null || args.length != 1) {
+                throw new ReturnCodeException(198, "esqc_gps Java bridge requires exactly one configuration-file argument");
+            }
+            if (Data.getParsedVarCount() != 5) {
+                throw new ReturnCodeException(198,
+                        "esqc_gps Java bridge requires latitude longitude admin1 admin2 id variables, in that order");
+            }
+            int latVar = Data.mapParsedVarIndex(1);
+            int lonVar = Data.mapParsedVarIndex(2);
+            int admin1Var = Data.mapParsedVarIndex(3);
+            int admin2Var = Data.mapParsedVarIndex(4);
+            int idVar = Data.mapParsedVarIndex(5);
+            if (Data.isVarTypeString(latVar) || Data.isVarTypeString(lonVar)) {
+                throw new ReturnCodeException(109, "latitude() and longitude() must be numeric variables");
+            }
+
+            Path configPath = resolveRequiredPath(args[0], "configuration file");
+            config = Config.read(configPath);
+            checkOutputCollisions();
+
+            List<Long> observations = selectedObservations();
+            runDir = Files.createTempDirectory("esqc_gps_");
+            Path input = runDir.resolve("input.jsonl");
+            Path workerConfig = runDir.resolve("worker.json");
+            Path output = runDir.resolve("result.csv");
+            Path marker = runDir.resolve("success.marker");
+            Path log = runDir.resolve("worker.log");
+            Path worker = config.worker.isEmpty()
+                    ? extractWorker(runDir.resolve("gps_qc.py"))
+                    : resolveRequiredPath(config.worker, "worker script");
+
+            writeInputJsonl(input, observations, latVar, lonVar, admin1Var, admin2Var, idVar);
+            writeWorkerConfig(workerConfig, config, input, output, marker);
+            Files.deleteIfExists(output);
+            Files.deleteIfExists(marker);
+
+            List<String> python = choosePython(config.python);
+            List<String> command = new ArrayList<>(python);
+            command.add(worker.toString());
+            command.add(workerConfig.toString());
+            ProcessBuilder builder = new ProcessBuilder(command);
+            builder.redirectErrorStream(true);
+            builder.redirectOutput(log.toFile());
+            Map<String, String> environment = builder.environment();
+            environment.remove("OPENAI_API_KEY");
+            environment.remove("ESQC_AI_KEY");
+            // Do not let an inherited endpoint override redirect the API key.
+            // The standalone worker itself accepts OPENAI_BASE_URL only for
+            // isolated tests when invoked directly, never through Stata.
+            environment.remove("OPENAI_BASE_URL");
+            if (config.ai) {
+                environment.put("ESQC_AI_KEY", readApiKey(resolveRequiredPath(config.keyfile, "keyfile")));
+            }
+
+            SFIToolkit.displayln("  esqc_gps: running GIS QC for " + observations.size()
+                    + " selected observation(s) with " + config.model + (config.ai ? " (AI enabled)" : " (deterministic only)"));
+            Process process = builder.start();
+            boolean completed = process.waitFor(config.timeoutSeconds, TimeUnit.SECONDS);
+            if (!completed) {
+                terminate(process);
+                throw new ReturnCodeException(459,
+                        "esqc_gps worker exceeded timeout(" + config.timeoutSeconds + ")");
+            }
+            int exit = process.exitValue();
+            if (exit != 0) {
+                throw new ReturnCodeException(459,
+                        "esqc_gps worker failed with exit code " + exit + logTail(log, 40));
+            }
+
+            validateMarker(marker, observations.size());
+            List<ResultRow> rows = readAndValidateResults(output, observations);
+            publish(rows);
+            summarize(rows);
+            if (config.verbose) {
+                String tail = logTail(log, 25);
+                if (!tail.isEmpty()) {
+                    SFIToolkit.displayln(tail.substring(1));
+                }
+            }
+            if (config.keepFiles) {
+                SFIToolkit.displayln("  esqc_gps: retained diagnostic files in " + runDir);
+                runDir = null;
+            }
+            return 0;
+        } catch (ReturnCodeException exc) {
+            SFIToolkit.errorln(exc.getMessage());
+            if (runDir != null) {
+                Path log = runDir.resolve("worker.log");
+                try {
+                    String tail = logTail(log, 40);
+                    if (!tail.isEmpty()) {
+                        SFIToolkit.errorln(tail.substring(1));
+                    }
+                } catch (Exception ignored) {
+                    // preserve the original error
+                }
+                if (config != null && config.keepFiles) {
+                    SFIToolkit.errorln("esqc_gps diagnostic files retained in " + runDir);
+                    runDir = null;
+                }
+            }
+            return exc.returnCode;
+        } catch (InvalidPathException exc) {
+            SFIToolkit.errorln("esqc_gps invalid path: " + exc.getInput());
+            return 601;
+        } catch (InterruptedException exc) {
+            Thread.currentThread().interrupt();
+            SFIToolkit.errorln("esqc_gps was interrupted");
+            return 1;
+        } catch (Exception exc) {
+            SFIToolkit.errorln("esqc_gps Java bridge failed: " + exc.getClass().getSimpleName()
+                    + ": " + safeMessage(exc));
+            return 459;
+        } finally {
+            if (runDir != null) {
+                try {
+                    deleteTree(runDir);
+                } catch (Exception ignored) {
+                    // Temporary-file cleanup must not mask the command result.
+                }
+            }
+        }
+    }
+
+    private static List<Long> selectedObservations() {
+        long first = Data.getObsParsedIn1();
+        long last = Data.getObsParsedIn2();
+        List<Long> observations = new ArrayList<>();
+        for (long observation = first; observation <= last; observation++) {
+            if (Data.isParsedIfTrue(observation)) {
+                observations.add(observation);
+            }
+        }
+        return observations;
+    }
+
+    private static void checkOutputCollisions() throws ReturnCodeException {
+        List<String> collisions = new ArrayList<>();
+        for (String name : OUTPUT_NAMES) {
+            if (Data.getVarIndex(name) > 0) {
+                collisions.add(name);
+            }
+        }
+        if (!collisions.isEmpty()) {
+            throw new ReturnCodeException(110,
+                    "esqc_gps output variable(s) already exist: " + String.join(", ", collisions)
+                            + ". Specify replace to replace the complete result set.");
+        }
+    }
+
+    private static Path extractWorker(Path target) throws IOException, ReturnCodeException {
+        try (InputStream stream = GpsSfi.class.getResourceAsStream(RESOURCE)) {
+            if (stream == null) {
+                throw new ReturnCodeException(601,
+                        "embedded GPS worker is missing from esqc_gps.jar: " + RESOURCE);
+            }
+            Files.copy(stream, target, StandardCopyOption.REPLACE_EXISTING);
+        }
+        return target;
+    }
+
+    private static void writeInputJsonl(
+            Path path,
+            List<Long> observations,
+            int latVar,
+            int lonVar,
+            int admin1Var,
+            int admin2Var,
+            int idVar) throws IOException {
+        try (OutputStream output = Files.newOutputStream(path)) {
+            for (long observation : observations) {
+                StringBuilder row = new StringBuilder(256);
+                row.append('{');
+                row.append("\"row_id\":").append(observation).append(',');
+                row.append("\"tid\":").append(jsonString(readText(idVar, observation))).append(',');
+                row.append("\"lat\":").append(jsonNumberOrNull(latVar, observation)).append(',');
+                row.append("\"lon\":").append(jsonNumberOrNull(lonVar, observation)).append(',');
+                row.append("\"a3a\":").append(jsonString(readText(admin1Var, observation))).append(',');
+                row.append("\"a3x\":").append(jsonString(readText(admin2Var, observation)));
+                row.append("}\n");
+                output.write(row.toString().getBytes(StandardCharsets.UTF_8));
+            }
+        }
+    }
+
+    private static String readText(int variable, long observation) {
+        if (Data.isVarTypeString(variable)) {
+            String value = Data.getStr(variable, observation);
+            return value == null ? "" : value.trim();
+        }
+        double value = Data.getNum(variable, observation);
+        if (Missing.isMissing(value)) {
+            return "";
+        }
+        String formatted = Data.getFormattedValue(variable, observation, true);
+        return formatted == null ? Double.toString(value) : formatted.trim();
+    }
+
+    private static String jsonNumberOrNull(int variable, long observation) {
+        double value = Data.getNum(variable, observation);
+        if (Missing.isMissing(value) || !Double.isFinite(value)) {
+            return "null";
+        }
+        return Double.toString(value);
+    }
+
+    private static void writeWorkerConfig(
+            Path path,
+            Config config,
+            Path input,
+            Path output,
+            Path marker) throws IOException, ReturnCodeException {
+        Path shapefile = resolveRequiredPath(config.shapefile, "shapefile");
+        Path cache = resolveOptionalPath(config.cache);
+        Path map = resolveOptionalPath(config.mapGeojson);
+        Path mapHtml = resolveOptionalPath(config.mapHtml);
+        Path aiLog = resolveOptionalPath(config.aiLog);
+        Map<String, Object> values = new LinkedHashMap<>();
+        values.put("INPUT_JSONL", input.toString());
+        values.put("OUTPUT_CSV", output.toString());
+        values.put("SUCCESS_MARKER", marker.toString());
+        values.put("SHP_PATH", shapefile.toString());
+        values.put("COUNTRY_NAME", config.country);
+        values.put("COUNTRY_FIELD", config.countryField);
+        values.put("ADMIN1_FIELD", config.admin1Field);
+        values.put("ADMIN2_FIELD", config.admin2Field);
+        values.put("ASSUME_WGS84", config.assumeWgs84);
+        values.put("CACHE_FILE", cache == null ? "" : cache.toString());
+        values.put("MAP_GEOJSON", map == null ? "" : map.toString());
+        values.put("MAP_HTML", mapHtml == null ? "" : mapHtml.toString());
+        values.put("AI_VERIFY", config.ai);
+        values.put("AI_MODEL", config.model);
+        values.put("VISION_ENABLED", config.vision);
+        values.put("WEB_SEARCH", config.webSearch);
+        values.put("BASEMAP", config.basemap);
+        values.put("REASONING_EFFORT", config.reasoning);
+        values.put("AI_BATCH_SIZE", config.batchSize);
+        values.put("VISION_BATCH_SIZE", Math.min(config.batchSize, 5));
+        values.put("HTTP_TIMEOUT_SECS", Math.min(3600, Math.max(30, config.timeoutSeconds - 5)));
+        values.put("SNAP_TOLERANCE_KM", config.snapToleranceKm);
+        values.put("AI_FORCE", config.rerun);
+        values.put("AI_LOG", aiLog == null ? "" : aiLog.toString());
+        values.put("AI_LOG_PAYLOAD", config.aiLogPayload);
+        values.put("RUN_LABEL", "stata-" + Instant.now().toString());
+        Files.write(path, jsonObject(values).getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static List<String> choosePython(String configured) throws IOException, ReturnCodeException, InterruptedException {
+        if (!configured.isEmpty()) {
+            List<String> command = Collections.singletonList(resolveExecutable(configured));
+            if (!probePython(command)) {
+                throw new ReturnCodeException(601,
+                        "python() did not identify a usable Python 3 interpreter: " + configured);
+            }
+            return command;
+        }
+        List<List<String>> candidates = new ArrayList<>();
+        candidates.add(Collections.singletonList("python"));
+        candidates.add(Collections.singletonList("python3"));
+        candidates.add(Arrays.asList("py", "-3"));
+        for (List<String> candidate : candidates) {
+            if (probePython(candidate)) {
+                return candidate;
+            }
+        }
+        throw new ReturnCodeException(601,
+                "Python 3 was not found. Install Python 3.10+ or specify python(\"path/to/python\").");
+    }
+
+    private static String resolveExecutable(String configured) {
+        String value = configured.trim();
+        if (value.contains("/") || value.contains("\\") || new File(value).isAbsolute()) {
+            return SFIToolkit.resolvePath(value).getPath();
+        }
+        return value;
+    }
+
+    private static boolean probePython(List<String> command) throws IOException, InterruptedException {
+        List<String> probe = new ArrayList<>(command);
+        probe.add("--version");
+        Process process;
+        try {
+            process = new ProcessBuilder(probe).redirectErrorStream(true).start();
+        } catch (IOException exc) {
+            return false;
+        }
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        Thread drainer = new Thread(() -> {
+            try (InputStream input = process.getInputStream()) {
+                byte[] buffer = new byte[1024];
+                int count;
+                while ((count = input.read(buffer)) >= 0 && bytes.size() < 8192) {
+                    bytes.write(buffer, 0, count);
+                }
+            } catch (IOException ignored) {
+            }
+        }, "esqc-python-probe");
+        drainer.setDaemon(true);
+        drainer.start();
+        boolean finished = process.waitFor(10, TimeUnit.SECONDS);
+        if (!finished) {
+            terminate(process);
+            return false;
+        }
+        drainer.join(1000);
+        String text = new String(bytes.toByteArray(), StandardCharsets.UTF_8).toLowerCase(Locale.ROOT);
+        return process.exitValue() == 0 && text.contains("python 3");
+    }
+
+    private static String readApiKey(Path path) throws IOException, ReturnCodeException {
+        if (!Files.isRegularFile(path)) {
+            throw new ReturnCodeException(601, "keyfile does not exist or is not a regular file: " + path);
+        }
+        if (Files.size(path) > 64 * 1024) {
+            throw new ReturnCodeException(198, "keyfile is unexpectedly large");
+        }
+        try (BufferedReader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                String value = line.trim();
+                if (!value.isEmpty() && !value.startsWith("#")) {
+                    return value;
+                }
+            }
+        }
+        throw new ReturnCodeException(198, "keyfile contains no nonblank API key line");
+    }
+
+    private static void validateMarker(Path marker, int expectedRows) throws IOException, ReturnCodeException {
+        if (!Files.isRegularFile(marker)) {
+            throw new ReturnCodeException(459, "GPS worker did not write its success marker");
+        }
+        String text = Files.readString(marker, StandardCharsets.UTF_8).trim();
+        Matcher matcher = MARKER.matcher(text);
+        if (!matcher.matches()) {
+            throw new ReturnCodeException(459, "invalid GPS worker success marker: " + text);
+        }
+        if (!VERSION.equals(matcher.group(1))) {
+            throw new ReturnCodeException(459,
+                    "GPS worker/Java version mismatch: worker=" + matcher.group(1) + ", Java=" + VERSION);
+        }
+        int rows = Integer.parseInt(matcher.group(2));
+        if (rows != expectedRows) {
+            throw new ReturnCodeException(459,
+                    "GPS worker marker row count mismatch: expected " + expectedRows + ", got " + rows);
+        }
+    }
+
+    private static List<ResultRow> readAndValidateResults(Path path, List<Long> observations)
+            throws IOException, ReturnCodeException {
+        if (!Files.isRegularFile(path) || Files.size(path) == 0L) {
+            throw new ReturnCodeException(459, "GPS worker result CSV is missing or empty");
+        }
+        List<List<String>> records = parseCsv(path);
+        if (records.isEmpty()) {
+            throw new ReturnCodeException(459, "GPS worker result CSV has no header");
+        }
+        List<String> header = records.get(0);
+        if (!header.equals(Arrays.asList(HEADER))) {
+            throw new ReturnCodeException(459,
+                    "GPS worker result schema mismatch: expected " + Arrays.toString(HEADER)
+                            + ", got " + header);
+        }
+        if (records.size() - 1 != observations.size()) {
+            throw new ReturnCodeException(459,
+                    "GPS worker result row count mismatch: expected " + observations.size()
+                            + ", got " + (records.size() - 1));
+        }
+        List<ResultRow> rows = new ArrayList<>();
+        for (int index = 1; index < records.size(); index++) {
+            List<String> values = records.get(index);
+            if (values.size() != HEADER.length) {
+                throw new ReturnCodeException(459,
+                        "GPS result row " + index + " has " + values.size()
+                                + " columns; expected " + HEADER.length);
+            }
+            long rowId;
+            try {
+                rowId = Long.parseLong(values.get(0));
+            } catch (NumberFormatException exc) {
+                throw new ReturnCodeException(459, "GPS result row " + index + " has invalid row_id");
+            }
+            long expected = observations.get(index - 1);
+            if (rowId != expected) {
+                throw new ReturnCodeException(459,
+                        "GPS result row order/id mismatch at position " + index
+                                + ": expected " + expected + ", got " + rowId);
+            }
+            int flag;
+            try {
+                flag = Integer.parseInt(values.get(5));
+            } catch (NumberFormatException exc) {
+                throw new ReturnCodeException(459, "GPS result row " + index + " has invalid gps_flag");
+            }
+            if (flag != 0 && flag != 1) {
+                throw new ReturnCodeException(459,
+                        "GPS result row " + index + " gps_flag must be 0 or 1");
+            }
+            String status = values.get(4).trim();
+            if (!FINAL_STATUSES.contains(status)) {
+                throw new ReturnCodeException(459,
+                        "GPS result row " + index + " has unknown gps_status: " + status);
+            }
+            int expectedFlag = status.equals("ok") ? 0 : 1;
+            if (flag != expectedFlag) {
+                throw new ReturnCodeException(459,
+                        "GPS result row " + index + " gps_flag is inconsistent with " + status);
+            }
+
+            validateCoordinateContract(values.get(2), values.get(3), status, index);
+            String predictedAdmin2 = values.get(6).trim();
+            String predictedAdmin1 = values.get(7).trim();
+            String a3aStatus = values.get(8).trim();
+            String a3xStatus = values.get(9).trim();
+            String detail = values.get(10);
+            if (detail.trim().isEmpty()) {
+                throw new ReturnCodeException(459,
+                        "GPS result row " + index + " has empty detail");
+            }
+            if ((!a3aStatus.isEmpty() && !FIELD_STATUSES.contains(a3aStatus))
+                    || (!a3xStatus.isEmpty() && !FIELD_STATUSES.contains(a3xStatus))) {
+                throw new ReturnCodeException(459,
+                        "GPS result row " + index + " has an unknown field-level status");
+            }
+            if (INSIDE_STATUSES.contains(status)) {
+                if (predictedAdmin1.isEmpty() || predictedAdmin2.isEmpty()) {
+                    throw new ReturnCodeException(459,
+                            "GPS result row " + index + " lacks GPS-derived Admin1/Admin2");
+                }
+                if (a3aStatus.isEmpty() || a3xStatus.isEmpty()) {
+                    throw new ReturnCodeException(459,
+                            "GPS result row " + index + " lacks field-level match statuses");
+                }
+                String derived = deriveFinalStatus(a3aStatus, a3xStatus);
+                if (!status.equals(derived)) {
+                    throw new ReturnCodeException(459,
+                            "GPS result row " + index + " final status is inconsistent with field statuses");
+                }
+            } else if (!predictedAdmin1.isEmpty() || !predictedAdmin2.isEmpty()
+                    || !a3aStatus.isEmpty() || !a3xStatus.isEmpty()) {
+                throw new ReturnCodeException(459,
+                        "GPS result row " + index + " has unexpected derived fields for " + status);
+            }
+
+            rows.add(new ResultRow(
+                    rowId,
+                    status,
+                    flag,
+                    predictedAdmin1,
+                    predictedAdmin2,
+                    a3aStatus,
+                    a3xStatus,
+                    detail));
+        }
+        return rows;
+    }
+
+    private static void validateCoordinateContract(String latText, String lonText, String status, int row)
+            throws ReturnCodeException {
+        String latValue = latText.trim();
+        String lonValue = lonText.trim();
+        if (status.equals("missing")) {
+            if (!latValue.isEmpty() && !lonValue.isEmpty()) {
+                throw new ReturnCodeException(459,
+                        "GPS result row " + row + " is missing-status but both coordinates are present");
+            }
+            return;
+        }
+        if (latValue.isEmpty() || lonValue.isEmpty()) {
+            throw new ReturnCodeException(459,
+                    "GPS result row " + row + " lacks coordinates for status " + status);
+        }
+        double latitude;
+        double longitude;
+        try {
+            latitude = Double.parseDouble(latValue);
+            longitude = Double.parseDouble(lonValue);
+        } catch (NumberFormatException exc) {
+            throw new ReturnCodeException(459,
+                    "GPS result row " + row + " has nonnumeric coordinates");
+        }
+        boolean valid = Double.isFinite(latitude) && Double.isFinite(longitude)
+                && latitude >= -90.0 && latitude <= 90.0
+                && longitude >= -180.0 && longitude <= 180.0
+                && !(latitude == 0.0 && longitude == 0.0);
+        if (status.equals("invalid")) {
+            if (valid) {
+                throw new ReturnCodeException(459,
+                        "GPS result row " + row + " is invalid-status but coordinates are valid");
+            }
+        } else if (!valid) {
+            throw new ReturnCodeException(459,
+                    "GPS result row " + row + " has invalid coordinates for status " + status);
+        }
+    }
+
+    private static String deriveFinalStatus(String a3aStatus, String a3xStatus) {
+        if (a3aStatus.equals("mismatch") || a3xStatus.equals("mismatch")) {
+            return "mismatch";
+        }
+        if (a3aStatus.equals("missing") && a3xStatus.equals("missing")) {
+            return "no_reported_location";
+        }
+        if (a3aStatus.equals("not_found") || a3xStatus.equals("not_found")) {
+            return "reported_not_found";
+        }
+        return "ok";
+    }
+
+    private static void publish(List<ResultRow> rows) throws ReturnCodeException {
+        String token = Long.toUnsignedString(System.nanoTime(), 36);
+        String[] shadows = {
+                shadowName(token, 0), shadowName(token, 1), shadowName(token, 2),
+                shadowName(token, 3), shadowName(token, 4), shadowName(token, 5),
+                shadowName(token, 6)
+        };
+        boolean created = true;
+        try {
+            addString(shadows[0], 32);
+            addByte(shadows[1]);
+            addStrL(shadows[2]);
+            addStrL(shadows[3]);
+            addString(shadows[4], 20);
+            addString(shadows[5], 20);
+            addStrL(shadows[6]);
+
+            int[] variables = new int[shadows.length];
+            for (int index = 0; index < shadows.length; index++) {
+                variables[index] = Data.getVarIndex(shadows[index]);
+                if (variables[index] <= 0) {
+                    throw new ReturnCodeException(459,
+                            "SFI could not resolve staged output variable " + shadows[index]);
+                }
+            }
+            for (ResultRow row : rows) {
+                storeString(variables[0], row.observation, row.status);
+                storeNumber(variables[1], row.observation, row.flag);
+                storeString(variables[2], row.observation, row.admin1);
+                storeString(variables[3], row.observation, row.admin2);
+                storeString(variables[4], row.observation, row.a3aStatus);
+                storeString(variables[5], row.observation, row.a3xStatus);
+                storeString(variables[6], row.observation, row.detail);
+            }
+            for (int index = 0; index < variables.length; index++) {
+                int rc = Data.setVarLabel(variables[index], OUTPUT_LABELS[index]);
+                if (rc != 0) {
+                    throw new ReturnCodeException(rc,
+                            "SFI could not label staged output variable " + shadows[index]);
+                }
+            }
+            for (int index = 0; index < variables.length; index++) {
+                int current = Data.getVarIndex(shadows[index]);
+                int rc = Data.renameVar(current, OUTPUT_NAMES[index]);
+                if (rc != 0) {
+                    throw new ReturnCodeException(rc,
+                            "SFI could not publish " + OUTPUT_NAMES[index]);
+                }
+            }
+            Data.updateModified();
+        } catch (ReturnCodeException exc) {
+            if (created) {
+                rollback(shadows);
+            }
+            throw exc;
+        } catch (RuntimeException exc) {
+            if (created) {
+                rollback(shadows);
+            }
+            throw new ReturnCodeException(459,
+                    "SFI output transaction failed: " + safeMessage(exc));
+        }
+    }
+
+    private static String shadowName(String token, int index) {
+        String value = "__eg" + token + index;
+        return value.length() <= 30 ? value : value.substring(0, 29) + index;
+    }
+
+    private static void addString(String name, int length) throws ReturnCodeException {
+        int rc = Data.addVarStr(name, length);
+        if (rc != 0) {
+            throw new ReturnCodeException(rc, "SFI could not create staged string variable " + name);
+        }
+    }
+
+    private static void addByte(String name) throws ReturnCodeException {
+        int rc = Data.addVarByte(name);
+        if (rc != 0) {
+            throw new ReturnCodeException(rc, "SFI could not create staged byte variable " + name);
+        }
+    }
+
+    private static void addStrL(String name) throws ReturnCodeException {
+        int rc = Data.addVarStrL(name);
+        if (rc != 0) {
+            throw new ReturnCodeException(rc, "SFI could not create staged strL variable " + name);
+        }
+    }
+
+    private static void storeString(int variable, long observation, String value) throws ReturnCodeException {
+        int rc = Data.storeStr(variable, observation, value == null ? "" : value);
+        if (rc != 0) {
+            throw new ReturnCodeException(rc,
+                    "SFI could not store a string result at observation " + observation);
+        }
+    }
+
+    private static void storeNumber(int variable, long observation, double value) throws ReturnCodeException {
+        int rc = Data.storeNum(variable, observation, value);
+        if (rc != 0) {
+            throw new ReturnCodeException(rc,
+                    "SFI could not store a numeric result at observation " + observation);
+        }
+    }
+
+    private static void rollback(String[] shadows) {
+        for (String output : OUTPUT_NAMES) {
+            int variable = Data.getVarIndex(output);
+            if (variable > 0) {
+                Data.dropVar(variable);
+            }
+        }
+        for (String shadow : shadows) {
+            int variable = Data.getVarIndex(shadow);
+            if (variable > 0) {
+                Data.dropVar(variable);
+            }
+        }
+        Data.updateModified();
+    }
+
+    private static void summarize(List<ResultRow> rows) {
+        Map<String, Integer> counts = new LinkedHashMap<>();
+        for (ResultRow row : rows) {
+            counts.put(row.status, counts.getOrDefault(row.status, 0) + 1);
+        }
+        List<String> parts = new ArrayList<>();
+        for (Map.Entry<String, Integer> entry : counts.entrySet()) {
+            parts.add(entry.getKey() + "=" + entry.getValue());
+        }
+        SFIToolkit.displayln("  esqc_gps: wrote " + rows.size() + " row(s)"
+                + (parts.isEmpty() ? "" : " | " + String.join(" | ", parts)));
+    }
+
+    private static List<List<String>> parseCsv(Path path) throws IOException, ReturnCodeException {
+        String text = Files.readString(path, StandardCharsets.UTF_8);
+        if (!text.isEmpty() && text.charAt(0) == '\ufeff') {
+            text = text.substring(1);
+        }
+        List<List<String>> records = new ArrayList<>();
+        List<String> record = new ArrayList<>();
+        StringBuilder field = new StringBuilder();
+        boolean quoted = false;
+        boolean started = false;
+        for (int index = 0; index < text.length(); index++) {
+            char ch = text.charAt(index);
+            if (quoted) {
+                if (ch == '"') {
+                    if (index + 1 < text.length() && text.charAt(index + 1) == '"') {
+                        field.append('"');
+                        index++;
+                    } else {
+                        quoted = false;
+                    }
+                } else {
+                    field.append(ch);
+                }
+                started = true;
+                continue;
+            }
+            if (ch == '"' && field.length() == 0) {
+                quoted = true;
+                started = true;
+            } else if (ch == ',') {
+                record.add(field.toString());
+                field.setLength(0);
+                started = false;
+            } else if (ch == '\r' || ch == '\n') {
+                if (ch == '\r' && index + 1 < text.length() && text.charAt(index + 1) == '\n') {
+                    index++;
+                }
+                record.add(field.toString());
+                field.setLength(0);
+                if (!(record.size() == 1 && record.get(0).isEmpty() && !started)) {
+                    records.add(record);
+                }
+                record = new ArrayList<>();
+                started = false;
+            } else {
+                field.append(ch);
+                started = true;
+            }
+        }
+        if (quoted) {
+            throw new ReturnCodeException(459, "unterminated quoted field in GPS result CSV");
+        }
+        if (started || field.length() > 0 || !record.isEmpty()) {
+            record.add(field.toString());
+            records.add(record);
+        }
+        return records;
+    }
+
+    private static String logTail(Path path, int lines) throws IOException {
+        if (!Files.isRegularFile(path)) {
+            return "";
+        }
+        List<String> all = Files.readAllLines(path, StandardCharsets.UTF_8);
+        int from = Math.max(0, all.size() - lines);
+        if (from == all.size()) {
+            return "";
+        }
+        return "\n--- esqc_gps worker log ---\n" + String.join("\n", all.subList(from, all.size()));
+    }
+
+    private static void terminate(Process process) {
+        process.destroy();
+        try {
+            if (!process.waitFor(3, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                process.waitFor(3, TimeUnit.SECONDS);
+            }
+        } catch (InterruptedException exc) {
+            Thread.currentThread().interrupt();
+            process.destroyForcibly();
+        }
+    }
+
+    private static Path resolveRequiredPath(String value, String label) throws ReturnCodeException {
+        if (value == null || value.trim().isEmpty()) {
+            throw new ReturnCodeException(198, label + " is required");
+        }
+        File file = SFIToolkit.resolvePath(value.trim());
+        return file.toPath().toAbsolutePath().normalize();
+    }
+
+    private static Path resolveOptionalPath(String value) {
+        if (value == null || value.trim().isEmpty()) {
+            return null;
+        }
+        return SFIToolkit.resolvePath(value.trim()).toPath().toAbsolutePath().normalize();
+    }
+
+    private static String jsonObject(Map<String, Object> values) {
+        StringBuilder output = new StringBuilder();
+        output.append('{');
+        boolean first = true;
+        for (Map.Entry<String, Object> entry : values.entrySet()) {
+            if (!first) {
+                output.append(',');
+            }
+            first = false;
+            output.append(jsonString(entry.getKey())).append(':');
+            Object value = entry.getValue();
+            if (value instanceof Boolean || value instanceof Number) {
+                output.append(value.toString());
+            } else {
+                output.append(jsonString(value == null ? "" : value.toString()));
+            }
+        }
+        output.append('}');
+        return output.toString();
+    }
+
+    private static String jsonString(String value) {
+        StringBuilder output = new StringBuilder(value.length() + 16);
+        output.append('"');
+        for (int index = 0; index < value.length(); index++) {
+            char ch = value.charAt(index);
+            switch (ch) {
+                case '"': output.append("\\\""); break;
+                case '\\': output.append("\\\\"); break;
+                case '\b': output.append("\\b"); break;
+                case '\f': output.append("\\f"); break;
+                case '\n': output.append("\\n"); break;
+                case '\r': output.append("\\r"); break;
+                case '\t': output.append("\\t"); break;
+                default:
+                    if (ch < 0x20) {
+                        output.append(String.format(Locale.ROOT, "\\u%04x", (int) ch));
+                    } else {
+                        output.append(ch);
+                    }
+            }
+        }
+        output.append('"');
+        return output.toString();
+    }
+
+    private static void deleteTree(Path root) throws IOException {
+        if (!Files.exists(root)) {
+            return;
+        }
+        try (java.util.stream.Stream<Path> stream = Files.walk(root)) {
+            List<Path> paths = new ArrayList<>();
+            stream.forEach(paths::add);
+            paths.sort(Collections.reverseOrder());
+            for (Path path : paths) {
+                Files.deleteIfExists(path);
+            }
+        }
+    }
+
+    private static String safeMessage(Throwable throwable) {
+        String message = throwable.getMessage();
+        return message == null || message.isEmpty() ? throwable.toString() : message;
+    }
+
+    private static final class ResultRow {
+        private final long observation;
+        private final String status;
+        private final int flag;
+        private final String admin1;
+        private final String admin2;
+        private final String a3aStatus;
+        private final String a3xStatus;
+        private final String detail;
+
+        private ResultRow(long observation, String status, int flag, String admin1,
+                          String admin2, String a3aStatus, String a3xStatus, String detail) {
+            this.observation = observation;
+            this.status = status;
+            this.flag = flag;
+            this.admin1 = admin1;
+            this.admin2 = admin2;
+            this.a3aStatus = a3aStatus;
+            this.a3xStatus = a3xStatus;
+            this.detail = detail;
+        }
+    }
+
+    private static final class ReturnCodeException extends Exception {
+        private final int returnCode;
+
+        private ReturnCodeException(int returnCode, String message) {
+            super(message);
+            this.returnCode = returnCode;
+        }
+    }
+
+    private static final class Config {
+        private final String shapefile;
+        private final String country;
+        private final boolean ai;
+        private final String keyfile;
+        private final String model;
+        private final boolean vision;
+        private final boolean webSearch;
+        private final String basemap;
+        private final String reasoning;
+        private final int batchSize;
+        private final int timeoutSeconds;
+        private final String python;
+        private final String worker;
+        private final String cache;
+        private final String mapGeojson;
+        private final String mapHtml;
+        private final String aiLog;
+        private final boolean aiLogPayload;
+        private final boolean rerun;
+        private final double snapToleranceKm;
+        private final boolean assumeWgs84;
+        private final String countryField;
+        private final String admin1Field;
+        private final String admin2Field;
+        private final boolean keepFiles;
+        private final boolean verbose;
+
+        private Config(Map<String, String> values) throws ReturnCodeException {
+            shapefile = required(values, "shapefile");
+            country = values.getOrDefault("country", "").trim();
+            ai = bool(values, "ai", false);
+            keyfile = values.getOrDefault("keyfile", "").trim();
+            model = values.getOrDefault("model", "gpt-5.6-luna").trim();
+            vision = bool(values, "vision", true);
+            webSearch = bool(values, "websearch", true);
+            basemap = values.getOrDefault("basemap", "google_hybrid").trim();
+            reasoning = values.getOrDefault("reasoning", "medium").trim();
+            batchSize = integer(values, "batchsize", 10, 1, 50);
+            timeoutSeconds = integer(values, "timeout", 7200, 30, 86400);
+            python = values.getOrDefault("python", "").trim();
+            worker = values.getOrDefault("worker", "").trim();
+            cache = values.getOrDefault("cache", "").trim();
+            mapGeojson = values.getOrDefault("mapgeojson", "").trim();
+            mapHtml = values.getOrDefault("maphtml", "").trim();
+            aiLog = values.getOrDefault("ailog", "").trim();
+            aiLogPayload = bool(values, "ailogpayload", false);
+            rerun = bool(values, "rerun", false);
+            snapToleranceKm = number(values, "snaptolerance", 0.0, 0.0, 100.0);
+            assumeWgs84 = bool(values, "assumewgs84", false);
+            countryField = values.getOrDefault("countryfield", "NAM_0").trim();
+            admin1Field = values.getOrDefault("admin1field", "NAM_1").trim();
+            admin2Field = values.getOrDefault("admin2field", "NAM_2").trim();
+            keepFiles = bool(values, "keepfiles", false);
+            verbose = bool(values, "verbose", false);
+
+            if (!Arrays.asList("gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna").contains(model)) {
+                throw new ReturnCodeException(198,
+                        "model() must be gpt-5.6, gpt-5.6-sol, gpt-5.6-terra, or gpt-5.6-luna");
+            }
+            if (!Arrays.asList("none", "low", "medium", "high", "xhigh", "max").contains(reasoning)) {
+                throw new ReturnCodeException(198,
+                        "reasoning() must be none, low, medium, high, xhigh, or max");
+            }
+            if (!Arrays.asList("osm", "google_hybrid", "google_sat", "google_road").contains(basemap)) {
+                throw new ReturnCodeException(198,
+                        "basemap() must be osm, google_hybrid, google_sat, or google_road");
+            }
+            if (ai && keyfile.isEmpty()) {
+                throw new ReturnCodeException(198, "ai requires keyfile()");
+            }
+            if (!ai && (!keyfile.isEmpty() || aiLogPayload)) {
+                throw new ReturnCodeException(198,
+                        "keyfile() and ailogpayload require the ai option");
+            }
+            for (Map.Entry<String, String> entry : values.entrySet()) {
+                if (entry.getValue().indexOf('\0') >= 0) {
+                    throw new ReturnCodeException(198,
+                            "configuration value contains a NUL character: " + entry.getKey());
+                }
+            }
+        }
+
+        private static Config read(Path path) throws IOException, ReturnCodeException {
+            if (!Files.isRegularFile(path)) {
+                throw new ReturnCodeException(601, "configuration file not found: " + path);
+            }
+            Map<String, String> values = new HashMap<>();
+            try (BufferedReader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+                String line;
+                int lineNumber = 0;
+                while ((line = reader.readLine()) != null) {
+                    lineNumber++;
+                    if (line.isEmpty() || line.startsWith("#")) {
+                        continue;
+                    }
+                    int tab = line.indexOf('\t');
+                    if (tab <= 0) {
+                        throw new ReturnCodeException(198,
+                                "malformed esqc_gps configuration line " + lineNumber);
+                    }
+                    String key = line.substring(0, tab).trim().toLowerCase(Locale.ROOT);
+                    String value = line.substring(tab + 1);
+                    if (values.put(key, value) != null) {
+                        throw new ReturnCodeException(198,
+                                "duplicate esqc_gps configuration key: " + key);
+                    }
+                }
+            }
+            return new Config(values);
+        }
+
+        private static String required(Map<String, String> values, String key) throws ReturnCodeException {
+            String value = values.getOrDefault(key, "").trim();
+            if (value.isEmpty()) {
+                throw new ReturnCodeException(198, key + " is required");
+            }
+            return value;
+        }
+
+        private static boolean bool(Map<String, String> values, String key, boolean defaultValue)
+                throws ReturnCodeException {
+            String raw = values.get(key);
+            if (raw == null || raw.trim().isEmpty()) {
+                return defaultValue;
+            }
+            String value = raw.trim().toLowerCase(Locale.ROOT);
+            if (Arrays.asList("1", "true", "yes", "on").contains(value)) {
+                return true;
+            }
+            if (Arrays.asList("0", "false", "no", "off").contains(value)) {
+                return false;
+            }
+            throw new ReturnCodeException(198, key + " must be true or false");
+        }
+
+        private static int integer(Map<String, String> values, String key, int defaultValue, int min, int max)
+                throws ReturnCodeException {
+            String raw = values.get(key);
+            int value;
+            try {
+                value = raw == null || raw.trim().isEmpty() ? defaultValue : Integer.parseInt(raw.trim());
+            } catch (NumberFormatException exc) {
+                throw new ReturnCodeException(198, key + " must be an integer");
+            }
+            if (value < min || value > max) {
+                throw new ReturnCodeException(198, key + " must be between " + min + " and " + max);
+            }
+            return value;
+        }
+
+        private static double number(Map<String, String> values, String key, double defaultValue,
+                                     double min, double max) throws ReturnCodeException {
+            String raw = values.get(key);
+            double value;
+            try {
+                value = raw == null || raw.trim().isEmpty() ? defaultValue : Double.parseDouble(raw.trim());
+            } catch (NumberFormatException exc) {
+                throw new ReturnCodeException(198, key + " must be numeric");
+            }
+            if (!Double.isFinite(value) || value < min || value > max) {
+                throw new ReturnCodeException(198, key + " must be between " + min + " and " + max);
+            }
+            return value;
+        }
+    }
+}

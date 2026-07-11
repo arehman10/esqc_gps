@@ -1,0 +1,4 @@
+package com.stata.sfi;
+public final class Missing {
+    public static boolean isMissing(double value) { return Double.isNaN(value); }
+}
